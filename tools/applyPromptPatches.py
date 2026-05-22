@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Apply locally-modified system prompts to the installed Claude Code binary
+via tweakcc, and verify the patches landed.
+
+Preconditions checked at startup:
+  - ``claude`` is on PATH and the symlink resolves.
+  - The repo's nearest ``vX.Y.Z`` tag reachable from HEAD matches
+    ``claude --version``. (tweakcc's regexes are version-specific; mismatched
+    versions silently no-op.)
+  - At least one file under ``system-prompts/`` differs from ``origin/main``.
+  - Every staged prompt has a usable verification needle (non-empty body,
+    first body line >= 20 chars).
+
+Usage:
+    applyPromptPatches.py           # detect, confirm, stage, apply, verify
+    applyPromptPatches.py --verify  # verify only (no staging, no apply)
+    applyPromptPatches.py --yes     # skip the confirmation prompt
+"""
+
+import argparse
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import git
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+PROMPTS_DIR = REPO_DIR / "system-prompts"
+TWEAKCC_DIR = Path.home() / ".tweakcc" / "system-prompts"
+UPSTREAM_REF = "origin/main"
+FRONTMATTER_RE = re.compile(r"\A<!--.*?-->\s*", re.DOTALL)
+CC_VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
+
+
+def repo() -> git.Repo:
+    return git.Repo(REPO_DIR)
+
+
+def resolve_cc_target() -> Path:
+    link = shutil.which("claude")
+    if not link:
+        raise RuntimeError("claude not found on PATH")
+    return Path(link).resolve(strict=True)
+
+
+def installed_cc_version() -> str:
+    out = subprocess.run(
+        ["claude", "--version"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    m = CC_VERSION_RE.search(out)
+    if not m:
+        raise RuntimeError(f"Could not parse Claude Code version from: {out!r}")
+    return m.group(1)
+
+
+def repo_base_version(r: git.Repo) -> str:
+    tag = r.git.describe("--tags", "--abbrev=0").strip()
+    if not tag.startswith("v"):
+        raise RuntimeError(f"Unexpected tag format from git describe: {tag!r}")
+    return tag[1:]
+
+
+def check_versions_match(r: git.Repo) -> None:
+    repo_v = repo_base_version(r)
+    cc_v = installed_cc_version()
+    print(f"Repo base version: v{repo_v}")
+    print(f"Installed CC version: {cc_v}")
+    if repo_v != cc_v:
+        raise RuntimeError(
+            f"Version mismatch: repo is based on v{repo_v} but installed CC is "
+            f"{cc_v}. Patches target a different binary and will not apply "
+            f"cleanly. Rebase onto v{cc_v} or switch CC to v{repo_v}."
+        )
+    print("Versions match.")
+
+
+def modified_prompts(r: git.Repo) -> list[Path]:
+    diff = r.git.diff("--name-only", UPSTREAM_REF, "--", "system-prompts/").strip()
+    if not diff:
+        return []
+    files = [REPO_DIR / line for line in diff.splitlines()]
+    for f in files:
+        if not f.is_file():
+            raise RuntimeError(f"Modified file does not exist on disk: {f}")
+    return files
+
+
+def body_excerpt(prompt_file: Path) -> str:
+    text = prompt_file.read_text()
+    body = FRONTMATTER_RE.sub("", text).strip()
+    if not body:
+        raise RuntimeError(f"Prompt body is empty: {prompt_file}")
+    first_line = body.splitlines()[0].strip()
+    if len(first_line) < 20:
+        raise RuntimeError(
+            f"First body line of {prompt_file.name} is too short to use as a "
+            f"verification needle ({len(first_line)} chars): {first_line!r}"
+        )
+    return first_line[:80]
+
+
+def verify(prompts: list[Path]) -> None:
+    target = resolve_cc_target()
+    binary = target.read_bytes()
+    print(f"Verifying patches in: {target}")
+    failures = []
+    for p in prompts:
+        needle = body_excerpt(p).encode()
+        if needle in binary:
+            print(f"  OK   {p.name}")
+        else:
+            print(f"  FAIL {p.name}")
+            failures.append(p)
+    if failures:
+        names = ", ".join(p.name for p in failures)
+        raise RuntimeError(f"Verification failed for: {names}")
+
+
+def confirm(prompts: list[Path]) -> None:
+    print("The following locally-modified prompts will be applied:")
+    for p in prompts:
+        print(f"  - {p.relative_to(REPO_DIR)}")
+    answer = input("Proceed? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("Aborted by user.")
+
+
+def stage_and_apply(prompts: list[Path]) -> None:
+    TWEAKCC_DIR.mkdir(parents=True, exist_ok=True)
+    for p in prompts:
+        dest = TWEAKCC_DIR / p.name
+        shutil.copy2(p, dest)
+        print(f"Staged: {dest}")
+    print("Running: npx tweakcc --apply")
+    subprocess.run(["npx", "tweakcc", "--apply"], check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify", action="store_true", help="Verify only.")
+    parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
+    args = parser.parse_args()
+
+    r = repo()
+    check_versions_match(r)
+
+    prompts = modified_prompts(r)
+    if not prompts:
+        raise SystemExit(f"No prompts under system-prompts/ differ from {UPSTREAM_REF}.")
+
+    for p in prompts:
+        body_excerpt(p)
+
+    if args.verify:
+        verify(prompts)
+        return
+
+    if not args.yes:
+        confirm(prompts)
+
+    stage_and_apply(prompts)
+    verify(prompts)
+
+
+if __name__ == "__main__":
+    main()
