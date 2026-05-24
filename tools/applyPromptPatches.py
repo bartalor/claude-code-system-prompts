@@ -7,11 +7,13 @@ Preconditions checked at startup:
   - The repo's nearest ``vX.Y.Z`` tag reachable from HEAD matches
     ``claude --version``. (tweakcc's regexes are version-specific; mismatched
     versions silently no-op.)
-  - At least one file under ``system-prompts/`` differs from ``origin/main``.
+  - At least one file under ``system-prompts/`` differs from the nearest
+    ``vX.Y.Z`` tag (i.e. the CC version this branch is based on).
   - Every staged prompt has a usable verification needle (non-empty body,
     first body line >= 20 chars).
   - For every modified prompt, the content currently embedded in the
-    installed binary matches the upstream baseline (``origin/main``). This
+    installed binary matches the upstream baseline (the same version tag).
+    This
     catches the case where CC was already tweaked, the binary drifted, or
     the regex pieces don't match this build — applying a patch on top of a
     non-baseline binary would be wrong.
@@ -36,7 +38,6 @@ PROMPTS_DIR = REPO_DIR / "system-prompts"
 TOOLS_DIR = REPO_DIR / "tools"
 READ_BINARY_PROMPTS_SHIM = TOOLS_DIR / "getPromptsFromBinary.mjs"
 TWEAKCC_DIR = Path.home() / ".tweakcc" / "system-prompts"
-UPSTREAM_REF = "origin/main"
 FRONTMATTER_RE = re.compile(r"\A<!--.*?-->\s*", re.DOTALL)
 CC_VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
@@ -83,8 +84,8 @@ def check_versions_match(r: git.Repo) -> None:
     print("Versions match.")
 
 
-def modified_prompts(r: git.Repo) -> list[Path]:
-    diff = r.git.diff("--name-only", UPSTREAM_REF, "--", "system-prompts/").strip()
+def modified_prompts(r: git.Repo, base: str) -> list[Path]:
+    diff = r.git.diff("--name-only", base, "--", "system-prompts/").strip()
     if not diff:
         return []
     files = [REPO_DIR / line for line in diff.splitlines()]
@@ -112,12 +113,12 @@ def strip_frontmatter(text: str) -> str:
     return FRONTMATTER_RE.sub("", text).strip()
 
 
-def upstream_baseline(r: git.Repo, prompt_file: Path) -> str:
+def upstream_baseline(r: git.Repo, prompt_file: Path, base: str) -> str:
     rel = prompt_file.relative_to(REPO_DIR).as_posix()
-    text = r.git.show(f"{UPSTREAM_REF}:{rel}")
+    text = r.git.show(f"{base}:{rel}")
     body = strip_frontmatter(text)
     if not body:
-        raise RuntimeError(f"Empty upstream baseline for {rel} at {UPSTREAM_REF}")
+        raise RuntimeError(f"Empty upstream baseline for {rel} at {base}")
     return body
 
 
@@ -133,14 +134,14 @@ def read_binary_prompts(target: Path) -> dict[str, str]:
 
 
 def check_baseline_matches_binary(
-    r: git.Repo, prompts: list[Path], target: Path
+    r: git.Repo, prompts: list[Path], target: Path, base: str
 ) -> None:
     binary_prompts = read_binary_prompts(target)
     mismatches: list[str] = []
     missing: list[str] = []
     for p in prompts:
         prompt_id = p.stem
-        baseline = upstream_baseline(r, p)
+        baseline = upstream_baseline(r, p, base)
         current = binary_prompts.get(prompt_id)
         if current is None:
             missing.append(prompt_id)
@@ -157,7 +158,7 @@ def check_baseline_matches_binary(
         if mismatches:
             lines.append(
                 "  Prompts whose embedded content differs from "
-                f"{UPSTREAM_REF}: {', '.join(mismatches)}"
+                f"{base}: {', '.join(mismatches)}"
             )
         raise RuntimeError("\n".join(lines))
     print(f"Baseline check passed for {len(prompts)} prompt(s).")
@@ -207,10 +208,11 @@ def main() -> None:
 
     r = repo()
     check_versions_match(r)
+    base = f"v{repo_base_version(r)}"
 
-    prompts = modified_prompts(r)
+    prompts = modified_prompts(r, base)
     if not prompts:
-        raise SystemExit(f"No prompts under system-prompts/ differ from {UPSTREAM_REF}.")
+        raise SystemExit(f"No prompts under system-prompts/ differ from {base}.")
 
     for p in prompts:
         body_excerpt(p)
@@ -220,7 +222,7 @@ def main() -> None:
         return
 
     target = resolve_cc_target()
-    check_baseline_matches_binary(r, prompts, target)
+    check_baseline_matches_binary(r, prompts, target, base)
 
     if not args.yes:
         confirm(prompts)
