@@ -134,35 +134,26 @@ def read_binary_prompts(target: Path) -> dict[str, str]:
     return {p["id"]: p["content"] for p in data["prompts"]}
 
 
-def check_baseline_matches_binary(
-    r: git.Repo, prompts: list[Path], target: Path, base: str
+def check_prompts_match_binary(
+    expected: dict[str, str], target: Path
 ) -> None:
     binary_prompts = read_binary_prompts(target)
     mismatches: list[str] = []
     missing: list[str] = []
-    for p in prompts:
-        prompt_id = p.stem
-        baseline = upstream_baseline(r, p, base)
+    for prompt_id, expected_content in expected.items():
         current = binary_prompts.get(prompt_id)
         if current is None:
             missing.append(prompt_id)
-            continue
-        if current != baseline:
+        elif current != expected_content:
             mismatches.append(prompt_id)
     if missing or mismatches:
-        lines = ["Refusing to apply: binary does not match upstream baseline."]
+        lines = ["Refusing to apply: binary content does not match expected."]
         if missing:
-            lines.append(
-                "  Prompts not found in binary (already customized or absent in "
-                f"this CC version): {', '.join(missing)}"
-            )
+            lines.append(f"  Not found in binary: {', '.join(missing)}")
         if mismatches:
-            lines.append(
-                "  Prompts whose embedded content differs from "
-                f"{base}: {', '.join(mismatches)}"
-            )
+            lines.append(f"  Content differs: {', '.join(mismatches)}")
         raise RuntimeError("\n".join(lines))
-    print(f"Baseline check passed for {len(prompts)} prompt(s).")
+    print(f"Binary content matches expected for {len(expected)} prompt(s).")
 
 
 def verify(prompts: list[Path]) -> None:
@@ -250,7 +241,8 @@ def main() -> None:
         return
 
     target = resolve_cc_target()
-    check_baseline_matches_binary(r, prompts, target, base)
+    expected = {p.stem: upstream_baseline(r, p, base) for p in prompts}
+    check_prompts_match_binary(expected, target)
 
     if args.dry_run:
         print("Dry run: would apply the following prompts:")
