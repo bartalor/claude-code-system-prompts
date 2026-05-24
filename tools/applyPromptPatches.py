@@ -10,6 +10,11 @@ Preconditions checked at startup:
   - At least one file under ``system-prompts/`` differs from ``origin/main``.
   - Every staged prompt has a usable verification needle (non-empty body,
     first body line >= 20 chars).
+  - For every modified prompt, the content currently embedded in the
+    installed binary matches the upstream baseline (``origin/main``). This
+    catches the case where CC was already tweaked, the binary drifted, or
+    the regex pieces don't match this build — applying a patch on top of a
+    non-baseline binary would be wrong.
 
 Usage:
     applyPromptPatches.py           # detect, confirm, stage, apply, verify
@@ -18,6 +23,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -27,6 +33,8 @@ import git
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 PROMPTS_DIR = REPO_DIR / "system-prompts"
+TOOLS_DIR = REPO_DIR / "tools"
+READ_BINARY_PROMPTS_SHIM = TOOLS_DIR / "getPromptsFromBinary.mjs"
 TWEAKCC_DIR = Path.home() / ".tweakcc" / "system-prompts"
 UPSTREAM_REF = "origin/main"
 FRONTMATTER_RE = re.compile(r"\A<!--.*?-->\s*", re.DOTALL)
@@ -100,6 +108,61 @@ def body_excerpt(prompt_file: Path) -> str:
     return first_line[:80]
 
 
+def strip_frontmatter(text: str) -> str:
+    return FRONTMATTER_RE.sub("", text).strip()
+
+
+def upstream_baseline(r: git.Repo, prompt_file: Path) -> str:
+    rel = prompt_file.relative_to(REPO_DIR).as_posix()
+    text = r.git.show(f"{UPSTREAM_REF}:{rel}")
+    body = strip_frontmatter(text)
+    if not body:
+        raise RuntimeError(f"Empty upstream baseline for {rel} at {UPSTREAM_REF}")
+    return body
+
+
+def read_binary_prompts(target: Path) -> dict[str, str]:
+    out = subprocess.run(
+        ["node", str(READ_BINARY_PROMPTS_SHIM), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    data = json.loads(out)
+    return {p["id"]: p["content"] for p in data["prompts"]}
+
+
+def check_baseline_matches_binary(
+    r: git.Repo, prompts: list[Path], target: Path
+) -> None:
+    binary_prompts = read_binary_prompts(target)
+    mismatches: list[str] = []
+    missing: list[str] = []
+    for p in prompts:
+        prompt_id = p.stem
+        baseline = upstream_baseline(r, p)
+        current = binary_prompts.get(prompt_id)
+        if current is None:
+            missing.append(prompt_id)
+            continue
+        if current != baseline:
+            mismatches.append(prompt_id)
+    if missing or mismatches:
+        lines = ["Refusing to apply: binary does not match upstream baseline."]
+        if missing:
+            lines.append(
+                "  Prompts not found in binary (already customized or absent in "
+                f"this CC version): {', '.join(missing)}"
+            )
+        if mismatches:
+            lines.append(
+                "  Prompts whose embedded content differs from "
+                f"{UPSTREAM_REF}: {', '.join(mismatches)}"
+            )
+        raise RuntimeError("\n".join(lines))
+    print(f"Baseline check passed for {len(prompts)} prompt(s).")
+
+
 def verify(prompts: list[Path]) -> None:
     target = resolve_cc_target()
     binary = target.read_bytes()
@@ -155,6 +218,9 @@ def main() -> None:
     if args.verify:
         verify(prompts)
         return
+
+    target = resolve_cc_target()
+    check_baseline_matches_binary(r, prompts, target)
 
     if not args.yes:
         confirm(prompts)

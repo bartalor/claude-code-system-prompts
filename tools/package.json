@@ -1,0 +1,8 @@
+{
+  "name": "claude-code-system-prompts-tools",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "tweakcc": "file:../../tweakcc"
+  }
+}
