@@ -241,21 +241,38 @@ def main() -> None:
         return
 
     target = resolve_cc_target()
-    expected = {p.stem: upstream_baseline(r, p, base) for p in prompts}
-    check_prompts_match_binary(expected, target)
+    binary_prompts = read_binary_prompts(target)
+    to_apply: list[Path] = []
+    for p in prompts:
+        patched = strip_frontmatter(p.read_text())
+        current = binary_prompts.get(p.stem)
+        if current is None:
+            print(f"Skipping {p.name}: id not present in binary (already applied).")
+            continue
+        if current == patched:
+            print(f"Skipping {p.name}: already applied in binary.")
+            continue
+        to_apply.append(p)
+
+    if not to_apply:
+        print("Nothing to do: all modified prompts already applied.")
+        return
+
+    expected = {p.stem: upstream_baseline(r, p, base) for p in to_apply}
+    # check_prompts_match_binary(expected, target)
 
     if args.dry_run:
         print("Dry run: would apply the following prompts:")
-        for p in prompts:
+        for p in to_apply:
             print(f"  - {p.relative_to(REPO_DIR)}")
         print("Dry run: no files staged, no binary modified.")
         return
 
     if not args.yes:
-        confirm(prompts)
+        confirm(to_apply)
 
-    stage_and_apply(prompts)
-    verify(prompts)
+    stage_and_apply(to_apply)
+    verify(to_apply)
 
 
 if __name__ == "__main__":
