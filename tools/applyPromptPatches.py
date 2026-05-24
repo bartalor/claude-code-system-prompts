@@ -19,9 +19,10 @@ Preconditions checked at startup:
     non-baseline binary would be wrong.
 
 Usage:
-    applyPromptPatches.py           # detect, confirm, stage, apply, verify
-    applyPromptPatches.py --verify  # verify only (no staging, no apply)
-    applyPromptPatches.py --yes     # skip the confirmation prompt
+    applyPromptPatches.py            # detect, confirm, stage, apply, verify
+    applyPromptPatches.py --verify   # verify only (no staging, no apply)
+    applyPromptPatches.py --dry-run  # run preconditions, print plan, stop
+    applyPromptPatches.py --yes      # skip the confirmation prompt
 """
 
 import argparse
@@ -191,18 +192,45 @@ def confirm(prompts: list[Path]) -> None:
 
 
 def stage_and_apply(prompts: list[Path]) -> None:
-    TWEAKCC_DIR.mkdir(parents=True, exist_ok=True)
-    for p in prompts:
-        dest = TWEAKCC_DIR / p.name
-        shutil.copy2(p, dest)
-        print(f"Staged: {dest}")
-    print("Running: npx tweakcc --apply")
-    subprocess.run(["npx", "tweakcc", "--apply"], check=True)
+    if not TWEAKCC_DIR.is_dir():
+        raise RuntimeError(
+            f"{TWEAKCC_DIR} does not exist. Run `npx tweakcc --list-system-prompts` "
+            f"once to populate it, then re-run."
+        )
+    originals: list[tuple[Path, bytes]] = []
+    try:
+        for p in prompts:
+            dest = TWEAKCC_DIR / p.name
+            if not dest.is_file():
+                raise RuntimeError(
+                    f"Canonical file missing: {dest}. Run "
+                    f"`npx tweakcc --list-system-prompts` to repopulate, then re-run."
+                )
+            originals.append((dest, dest.read_bytes()))
+            shutil.copy2(p, dest)
+            print(f"Overwrote canonical {dest.name}")
+        print("Running: npx tweakcc --apply")
+        subprocess.run(["npx", "tweakcc", "--apply"], check=True)
+    finally:
+        for dest, content in originals:
+            try:
+                dest.write_bytes(content)
+                print(f"Restored canonical {dest.name}")
+            except OSError as e:
+                print(
+                    f"WARNING: failed to restore {dest}: {e}. Restore manually."
+                )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify", action="store_true", help="Verify only.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run preconditions and print what would be applied, without "
+        "touching ~/.tweakcc or the installed binary.",
+    )
     parser.add_argument("--yes", action="store_true", help="Skip confirmation.")
     args = parser.parse_args()
 
@@ -223,6 +251,13 @@ def main() -> None:
 
     target = resolve_cc_target()
     check_baseline_matches_binary(r, prompts, target, base)
+
+    if args.dry_run:
+        print("Dry run: would apply the following prompts:")
+        for p in prompts:
+            print(f"  - {p.relative_to(REPO_DIR)}")
+        print("Dry run: no files staged, no binary modified.")
+        return
 
     if not args.yes:
         confirm(prompts)
