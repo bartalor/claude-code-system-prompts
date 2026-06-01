@@ -156,6 +156,14 @@ def check_prompts_match_binary(
     print(f"Binary content matches expected for {len(expected)} prompt(s).")
 
 
+TEMPLATE_VAR_RE = re.compile(r"\$\{")
+
+
+def template_var_count(prompt_file: Path) -> int:
+    body = strip_frontmatter(prompt_file.read_text())
+    return len(TEMPLATE_VAR_RE.findall(body))
+
+
 def verify(prompts: list[Path]) -> None:
     target = resolve_cc_target()
     binary = target.read_bytes()
@@ -169,8 +177,25 @@ def verify(prompts: list[Path]) -> None:
             print(f"  FAIL {p.name}")
             failures.append(p)
     if failures:
-        names = ", ".join(p.name for p in failures)
-        raise RuntimeError(f"Verification failed for: {names}")
+        lines = [f"Verification failed for: {', '.join(p.name for p in failures)}"]
+        templated = [p for p in failures if template_var_count(p) > 0]
+        if templated:
+            lines.append(
+                "Likely cause: the prompt body contains template variables "
+                "(${...}) that tweakcc escapes literally when building its "
+                "full-body match regex. The binary has those variables already "
+                "interpolated, so the regex never matches and `tweakcc --apply` "
+                "silently no-ops. Affected:"
+            )
+            for p in templated:
+                lines.append(
+                    f"  - {p.name} ({template_var_count(p)} template var(s))"
+                )
+            lines.append(
+                "Patch these via `tweakcc adhoc-patch` against a template-free "
+                "anchor instead of the canonical --apply flow."
+            )
+        raise RuntimeError("\n".join(lines))
 
 
 def confirm(prompts: list[Path]) -> None:
@@ -244,12 +269,16 @@ def main() -> None:
     binary_prompts = read_binary_prompts(target)
     to_apply: list[Path] = []
     for p in prompts:
+        canonical = TWEAKCC_DIR / p.name
+        if not canonical.is_file():
+            raise RuntimeError(
+                f"{p.name} has no canonical file in {TWEAKCC_DIR} — "
+                f"tweakcc cannot patch it. Run "
+                f"`npx tweakcc --list-system-prompts` to repopulate."
+            )
         patched = strip_frontmatter(p.read_text())
         current = binary_prompts.get(p.stem)
-        if current is None:
-            print(f"Skipping {p.name}: id not present in binary (already applied).")
-            continue
-        if current == patched:
+        if current is not None and current == patched:
             print(f"Skipping {p.name}: already applied in binary.")
             continue
         to_apply.append(p)
