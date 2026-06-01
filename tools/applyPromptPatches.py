@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["GitPython"]
+# ///
 """Apply locally-modified system prompts to the installed Claude Code binary
 via tweakcc, and verify the patches landed.
 
@@ -207,6 +211,31 @@ def confirm(prompts: list[Path]) -> None:
         raise SystemExit("Aborted by user.")
 
 
+def adhoc_patch(prompt_file: Path, baseline: str, patched: str) -> None:
+    print(f"Running: npx tweakcc adhoc-patch -s ... ({prompt_file.name})")
+    result = subprocess.run(
+        [
+            "npx",
+            "tweakcc",
+            "adhoc-patch",
+            "-s",
+            baseline,
+            patched,
+            "--confirm-possible-dangerous-patch",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="")
+        raise subprocess.CalledProcessError(
+            result.returncode, ["npx", "tweakcc", "adhoc-patch"]
+        )
+
+
 def stage_and_apply(prompts: list[Path]) -> None:
     if not TWEAKCC_DIR.is_dir():
         raise RuntimeError(
@@ -226,7 +255,17 @@ def stage_and_apply(prompts: list[Path]) -> None:
             shutil.copy2(p, dest)
             print(f"Overwrote canonical {dest.name}")
         print("Running: npx tweakcc --apply")
-        subprocess.run(["npx", "tweakcc", "--apply"], check=True)
+        result = subprocess.run(
+            ["npx", "tweakcc", "--apply"], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="")
+            raise subprocess.CalledProcessError(
+                result.returncode, ["npx", "tweakcc", "--apply"]
+            )
     finally:
         for dest, content in originals:
             try:
@@ -297,11 +336,31 @@ def main() -> None:
         print("Dry run: no files staged, no binary modified.")
         return
 
+    template_free = [p for p in to_apply if template_var_count(p) == 0]
+    template_var = [p for p in to_apply if template_var_count(p) > 0]
+
     if not args.yes:
         confirm(to_apply)
 
-    stage_and_apply(to_apply)
-    verify(to_apply)
+    attempted: list[Path] = []
+    if template_free:
+        stage_and_apply(template_free)
+        attempted.extend(template_free)
+
+    for p in template_var:
+        answer = input(
+            f"{p.name} contains template variables; apply via adhoc-patch? [y/N] "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print(f"Skipping {p.name}.")
+            continue
+        baseline = upstream_baseline(r, p, base)
+        patched = strip_frontmatter(p.read_text())
+        adhoc_patch(p, baseline, patched)
+        attempted.append(p)
+
+    if attempted:
+        verify(attempted)
 
 
 if __name__ == "__main__":
